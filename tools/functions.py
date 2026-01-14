@@ -1,0 +1,194 @@
+from typing import Dict, Any
+from google.adk.tools.tool_context import ToolContext
+from google.genai import types
+from services import processing
+import base64
+import os
+from pathlib import Path
+
+
+def load_image_tool(
+    image_path: str,
+    tool_context: ToolContext = None
+) -> Dict[str, Any]:
+    """
+    Loads an image file and returns its base64 encoding and metadata.
+    
+    This tool allows the manager to load a background-removed image so it can
+    be passed to the analyst for visual examination. Returns image dimensions
+    and file size to help the analyst understand the image scale.
+    
+    The image is resized to max 1024px on longest side for efficiency while
+    maintaining aspect ratio. The ORIGINAL dimensions are still reported so
+    the analyst can estimate coordinates for the full-size image.
+    
+    Args:
+        image_path: Path to the image file to load.
+        tool_context: Automatically injected by ADK.
+    
+    Returns:
+        dict: Contains base64_data, mime_type, original width/height, 
+              resized width/height, file_size_kb, and file info.
+    """
+    print(f"\n[Tool] load_image_tool called with: {image_path}")
+    
+    try:
+        from PIL import Image
+        
+        if not os.path.exists(image_path):
+            return {
+                "status": "error",
+                "message": f"Image file not found: {image_path}"
+            }
+        
+        # Load image to get original dimensions
+        img = Image.open(image_path).convert("RGB")
+        original_width, original_height = img.size
+        
+        # Get file size in KB
+        file_size_bytes = os.path.getsize(image_path)
+        file_size_kb = round(file_size_bytes / 1024, 2)
+        
+        # Resize for context efficiency (max 1024px on longest side)
+        MAX_SIZE = 1024
+        if max(original_width, original_height) > MAX_SIZE:
+            ratio = MAX_SIZE / max(original_width, original_height)
+            new_width = int(original_width * ratio)
+            new_height = int(original_height * ratio)
+            img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            print(f"  [Load Image] Resized from {original_width}x{original_height} to {new_width}x{new_height}")
+        else:
+            img_resized = img
+            new_width, new_height = original_width, original_height
+            print(f"  [Load Image] No resize needed: {original_width}x{original_height}")
+        
+        # Determine MIME type
+        suffix = Path(image_path).suffix.lower()
+        mime_type_map = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.webp': 'image/webp'
+        }
+        mime_type = mime_type_map.get(suffix, 'image/jpeg')
+        
+        # Convert resized image to base64
+        from io import BytesIO
+        buffer = BytesIO()
+        img_resized.save(buffer, format='JPEG', quality=85)
+        image_data = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        
+        print(f"  [Load Image] Original: {original_width}x{original_height}px, {file_size_kb}KB")
+        print(f"  [Load Image] Base64 size: {len(image_data)} bytes")
+        
+        result = {
+            "status": "success",
+            "image_path": image_path,
+            "base64_data": image_data,
+            "mime_type": mime_type,
+            "original_width": original_width,
+            "original_height": original_height,
+            "display_width": new_width,
+            "display_height": new_height,
+            "file_size_kb": file_size_kb,
+            "message": f"Image loaded successfully: Original {original_width}x{original_height}px, Display {new_width}x{new_height}px ({file_size_kb}KB)"
+        }
+        
+        print(f"[Tool] load_image_tool success")
+        return result
+        
+    except Exception as e:
+        error_result = {
+            "status": "error",
+            "message": f"Failed to load image: {str(e)}"
+        }
+        print(f"[Tool] load_image_tool error: {error_result}")
+        return error_result
+
+
+def remove_background_tool(
+    image_path: str,
+    tool_context: ToolContext = None
+) -> Dict[str, Any]:
+    """
+    Removes the background from a microscopy image using BRIA RMBG-2.0 via HF Inference API.
+
+    Args:
+        image_path: Local path to the input image.
+        tool_context: Automatically injected by ADK.
+
+    Returns:
+        dict: Contains 'status' and the 'clean_image_path'.
+    """
+    print(f"\n[Tool] remove_background_tool called with: {image_path}")
+    
+    try:
+        clean_path = processing.execute_background_removal(image_path)
+        
+        result = {
+            "status": "success",
+            "clean_image_path": clean_path,
+            "message": f"Background removed successfully. Clean image saved to: {clean_path}"
+        }
+        print(f"[Tool] remove_background_tool result: {result}")
+        return result
+        
+    except Exception as e:
+        error_result = {
+            "status": "error", 
+            "message": f"Background removal failed: {str(e)}"
+        }
+        print(f"[Tool] remove_background_tool error: {error_result}")
+        return error_result
+
+
+def segment_organoid_sam3_tool(
+    image_path: str,
+    center_x: int,
+    center_y: int,
+    tool_context: ToolContext = None
+) -> Dict[str, Any]:
+    """
+    Segments an organoid from a background-removed image using SAM3 with a positive point prompt.
+    
+    This tool uses the Segment Anything Model 3 (SAM3) to create a precise segmentation mask
+    of the organoid based on a center point coordinate. The point acts as a positive prompt,
+    telling SAM3 "this is inside the object I want to segment."
+
+    Args:
+        image_path: Path to the background-removed image to segment.
+        center_x: X coordinate of the organoid center (positive point prompt).
+        center_y: Y coordinate of the organoid center (positive point prompt).
+        tool_context: Automatically injected by ADK.
+
+    Returns:
+        dict: Contains 'status', 'mask_path', and relevant information about the segmentation.
+    """
+    print(f"\n[Tool] segment_organoid_sam3_tool called")
+    print(f"  Image: {image_path}")
+    print(f"  Center point: ({center_x}, {center_y})")
+    
+    try:
+        mask_path = processing.execute_sam3_segmentation(
+            image_path=image_path,
+            point_x=center_x,
+            point_y=center_y
+        )
+        
+        result = {
+            "status": "success",
+            "mask_path": mask_path,
+            "center_point": {"x": center_x, "y": center_y},
+            "message": f"SAM3 segmentation complete. Mask saved to: {mask_path}"
+        }
+        print(f"[Tool] segment_organoid_sam3_tool result: {result}")
+        return result
+        
+    except Exception as e:
+        error_result = {
+            "status": "error",
+            "message": f"SAM3 segmentation failed: {str(e)}",
+            "note": "Check model access and dependencies"
+        }
+        print(f"[Tool] segment_organoid_sam3_tool error: {error_result}")
+        return error_result
