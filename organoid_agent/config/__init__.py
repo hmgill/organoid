@@ -1,0 +1,1 @@
+from .settings import MANAGER_MODEL_ID, VISION_MODEL_ID, HF_TOKEN
